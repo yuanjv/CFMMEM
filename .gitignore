@@ -1,3 +1,7 @@
+# added by nz
+gut_minilm.pt
+
+# Python defaults
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
