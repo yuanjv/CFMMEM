@@ -135,6 +135,7 @@ class Episodes:
                 other.append(i)
         stream = home_items + other
         r.shuffle(stream)
+        Zc = torch.stack([self.cue(i) for i in stream])    # (T, d): each item's own partial cue (write-time surprise)
         Z = self.z[stream]                                 # (T, d): info tokens (core: 1 token each)
 
         seen, novel = set(), []
@@ -155,7 +156,7 @@ class Episodes:
                 m = (Z[t] @ qk - s.max()).item()           # cue margin vs other stored items
             q.append(qk); zt.append(zk); absent.append(t < 0)
             t_idx.append(t); delay.append(dl); margin.append(m)
-        return dict(Z=Z, novel=torch.tensor(novel), q=torch.stack(q), z=torch.stack(zt),
+        return dict(Z=Z, Zc=Zc, novel=torch.tensor(novel), q=torch.stack(q), z=torch.stack(zt),
                     absent=torch.tensor(absent), t_idx=torch.tensor(t_idx),
                     delay=torch.tensor(delay), margin=torch.tensor(margin))
 
