@@ -1,11 +1,16 @@
-"""cfmmem.py -- CFMMEM v0.1: model (§8-§12), training (§21), first audit (§16, §23-24).
+"""cfmmem.py -- CFMMEM v0.1 + patch 1: model (§8-§12), training (§21), first audit (§16, §23-24).
 
-  python cfmmem.py --cache gut_minilm.pt                      # full model, w = b * rho
-  python cfmmem.py --cache gut_minilm.pt --no_memory          # cue-only baseline (writer off), run this first
-  python cfmmem.py --cache gut_minilm.pt --label unif         # M_unif   (w = 1)
-  python cfmmem.py --cache gut_minilm.pt --label scram        # M_scram  (weights permuted within episode)
+  python cfmmem.py --cache gut_minilm.pt --no_memory --sigma 0.05    # cue-only baseline = denoising gate
+  python cfmmem.py --cache gut_minilm.pt --sigma 0.05                # full model
+  python cfmmem.py --cache gut_minilm.pt --label unif                # M_unif   (w = 1)
+  python cfmmem.py --cache gut_minilm.pt --label scram               # M_scram  (placebo: weights permuted)
 
-Needs cfmmem_data.py (with the Zc field). Untested at scale: read the first eval table before trusting anything.
+Patch 1 (own additions, not in the spec):
+  1. sigma=0 and single-sample reads in eval; gate line on absent-probe cos(u,q)
+  2. teacher-slot mixing: reader sometimes reads the stream's Z rows; 'teacher' eval row = perfect-storage bound
+  3. delay-0 scaffold probes (annealed to 0) + short->long stream curriculum
+  4. smaller lr for the writer + structural soft norm cap inside write()
+Needs cfmmem_data.py with the Zc field. Untested at scale: read the first eval table before trusting anything.
 """
 import argparse, copy, math, random
 import torch, torch.nn as nn, torch.nn.functional as F
@@ -83,7 +88,7 @@ class ReaderVelocity(nn.Module):                            # v_theta: CFM field
                                  nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, d))
         self.s = d ** 0.5
 
-    def forward(self, x, t, q, W):                          # x,q:(N,d) t:(N,1) W:(N,K,d)
+    def forward(self, x, t, q, W):                          # x,q:(N,d) t:(N,1) W:(N,K,d); rows are LayerNormed
         Wn = self.nw(W)
         qry = self.qp(torch.cat([self.nq(q), self.nx(x)], -1)).unsqueeze(1)
         ctx = self.ca(qry, Wn, Wn, need_weights=False)[0].squeeze(1)
@@ -91,13 +96,18 @@ class ReaderVelocity(nn.Module):                            # v_theta: CFM field
         return self.mlp(self.ada(h, self.t(t)))
 
 
+def softcap(W, c):                                          # structural soft norm cap: row norm n -> c*tanh(n/c)
+    n = W.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    return W * (c * torch.tanh(n / c) / n)
+
+
 # ---------------------------------------------------------------- model
 class CFMMEM(nn.Module):
-    def __init__(self, K=32, d=384, S_w=3, S_r=6, kappa=2.0, eps=0.1, sigma=0.1,
-                 p_uniform=0.2, tau_r=10.0, w_max=5.0):
+    def __init__(self, K=32, d=384, S_w=3, S_r=6, kappa=2.0, eps=0.1, sigma=0.05,
+                 p_uniform=0.2, tau_r=10.0, w_max=5.0, cap_c=1.5):
         super().__init__()
         self.K, self.d, self.S_w, self.S_r = K, d, S_w, S_r
-        self.kappa, self.eps, self.sigma = kappa, eps, sigma    # sigma fixed (a learned sigma would be driven to 0)
+        self.kappa, self.eps, self.sigma, self.cap_c = kappa, eps, sigma, cap_c   # sigma fixed (learned sigma -> 0)
         self.p_uniform, self.tau_r, self.w_max = p_uniform, tau_r, w_max
         self.W_init = nn.Parameter(torch.randn(K, d) * 0.5 / d ** 0.5)
         self.writer, self.reader = WriterVelocity(d), ReaderVelocity(d)
@@ -106,7 +116,7 @@ class CFMMEM(nn.Module):
     def write(self, W, Z):                                  # S_w Euler steps; source is the state, not noise
         for s in range(self.S_w):
             t = torch.full((W.shape[0], 1), s / self.S_w, device=W.device)
-            W = W + self.writer(W, t, Z) / self.S_w
+            W = softcap(W + self.writer(W, t, Z) / self.S_w, self.cap_c)
         return W
 
     def err(self, W, t, q, z, x0):                          # per-sample ||v - (z - x0)||^2 at times t:(N,1)
@@ -114,8 +124,9 @@ class CFMMEM(nn.Module):
         return ((self.reader(xt, t, q, W) - (z - x0)) ** 2).sum(-1)
 
     @torch.no_grad()
-    def read(self, W, q):                                   # inference; never writes
-        x = q + self.sigma * torch.randn_like(q)
+    def read(self, W, q, sigma=None):                       # inference; never writes. sigma=0 -> deterministic
+        s0 = self.sigma if sigma is None else sigma
+        x = q + s0 * torch.randn_like(q)
         for s in range(self.S_r):
             t = torch.full((q.shape[0], 1), s / self.S_r, device=q.device)
             x = x + self.reader(x, t, q, W) / self.S_r
@@ -154,6 +165,15 @@ class CFMMEM(nn.Module):
         return w.clamp(max=self.w_max), b
 
 
+def teacher_state(model, Z):
+    """Perfect storage: the stream's Z rows, padded with W_init rows to K rows. Reader rows are LayerNormed,
+    so scale is irrelevant; row order is irrelevant (no positional encodings)."""
+    B, T, d = Z.shape
+    assert T <= model.K, "teacher state needs T <= K"
+    pad = model.W_init[: model.K - T].detach().unsqueeze(0).expand(B, -1, -1)
+    return torch.cat([Z, pad], 1)
+
+
 # ---------------------------------------------------------------- one episode
 def run_episode(model, bt, L, label, grad, memory=True):
     """No-grad prefix + grad window (F9). Returns final state W, labels, last-write pair for reflow."""
@@ -178,9 +198,12 @@ def run_episode(model, bt, L, label, grad, memory=True):
     return W, dict(w=w, b=b, disp=torch.stack(disp).mean() if disp else torch.zeros(()), last=last)
 
 
-def probe_terms(model, W, bt, w_item):
+def probe_terms(model, W, bt, w_item, p_teach=0.0):
     B, P, d = bt["q"].shape
     K = W.shape[1]
+    if p_teach > 0:                                         # per-episode: read teacher slots instead of written W
+        use = torch.rand(B, 1, 1, device=W.device) < p_teach
+        W = torch.where(use, teacher_state(model, bt["Z"]), W)      # grad reaches the writer only where ~use
     q, z, ab = bt["q"].reshape(-1, d), bt["z"].reshape(-1, d), bt["absent"].reshape(-1)
     w = w_item.gather(1, bt["t_idx"].clamp_min(0)).masked_fill(bt["absent"], 1.0).reshape(-1)
     Wp = W.unsqueeze(1).expand(B, P, K, d).reshape(B * P, K, d)
@@ -190,6 +213,18 @@ def probe_terms(model, W, bt, w_item):
     Wo = z.unsqueeze(1).expand(-1, K, -1)                   # oracle state: z as K identical tokens (§16b)
     L_or = model.err(Wo, torch.rand_like(t), q, z, x0).mean()
     return L_read, L_or
+
+
+def scaffold_loss(model, W, bt, n):
+    """Spec §21 scaffolding: probe the last n written items (delay 0..n-1) with their own partial cues, written W only."""
+    B, T, d = bt["Z"].shape
+    n = min(n, T)
+    K = W.shape[1]
+    q, z = bt["Zc"][:, -n:].reshape(-1, d), bt["Z"][:, -n:].reshape(-1, d)
+    Wp = W.unsqueeze(1).expand(B, n, K, d).reshape(B * n, K, d)
+    x0 = q + model.sigma * torch.randn_like(q)
+    t = torch.rand(B * n, 1, device=W.device)
+    return model.err(Wp, t, q, z, x0).mean()
 
 
 def reflow_loss(model, last):                               # F2: endpoints detached
@@ -209,10 +244,10 @@ def evaluate(model, ep, args, dev, n_batches=8, n_xi=4, m_min=0.1):
     model.eval()
     grid = torch.tensor([.06, .19, .31, .44, .56, .69, .81, .94], device=dev)   # common, weight-independent
     lo, hi = grid <= .25, grid >= .75
-    names = ("mem", "abl", "shuf")
-    R = {k: [] for k in ("cos_q", "seg", "margin", "b", "absent_cos")}
+    names = ("mem", "abl", "shuf", "teach")
+    R = {k: [] for k in ("cos_q", "seg", "margin", "b", "absent_cos", "absent_cos0")}
     for c in names:
-        for k in ("cos_", "C_", "F_"):
+        for k in ("cos_", "cos0_", "C_", "F_"):
             R[k + c] = []
     for _ in range(n_batches):
         bt = to_dev(ep.batch(args.B), dev)
@@ -222,7 +257,8 @@ def evaluate(model, ep, args, dev, n_batches=8, n_xi=4, m_min=0.1):
         rep = lambda X: X.unsqueeze(1).expand(B, P, K, d).reshape(B * P, K, d)
         q, z, ab, mar = bt["q"].reshape(-1, d), bt["z"].reshape(-1, d), bt["absent"].reshape(-1), bt["margin"].reshape(-1)
         keep = mar >= m_min                                 # NaN (absent) compares False
-        conds = {"mem": rep(W), "abl": rep(model.W_init.unsqueeze(0).expand(B, -1, -1)), "shuf": rep(W.roll(1, 0))}
+        conds = {"mem": rep(W), "abl": rep(model.W_init.unsqueeze(0).expand(B, -1, -1)),
+                 "shuf": rep(W.roll(1, 0)), "teach": rep(teacher_state(model, bt["Z"]))}
         x0s = [q + model.sigma * torch.randn_like(q) for _ in range(n_xi)]      # common random numbers
 
         def profile(Wc):
@@ -235,11 +271,11 @@ def evaluate(model, ep, args, dev, n_batches=8, n_xi=4, m_min=0.1):
         e_or = profile(z.unsqueeze(1).expand(-1, K, -1))
         for c in names:
             tl = profile(conds[c]) - e_or                   # memory-attributable excess error
-            u = model.read(conds[c], q)
+            u, u0 = model.read(conds[c], q), model.read(conds[c], q, sigma=0.0)
             R["C_" + c].append(tl[:, lo].mean(1)[keep]); R["F_" + c].append(tl[:, hi].mean(1)[keep])
-            R["cos_" + c].append((u * z).sum(-1)[keep])
+            R["cos_" + c].append((u * z).sum(-1)[keep]); R["cos0_" + c].append((u0 * z).sum(-1)[keep])
             if c == "mem":
-                R["absent_cos"].append((u * q).sum(-1)[ab])
+                R["absent_cos"].append((u * q).sum(-1)[ab]); R["absent_cos0"].append((u0 * q).sum(-1)[ab])
         R["cos_q"].append((q * z).sum(-1)[keep])
         R["seg"].append(torch.arange(P, device=dev).expand(B, P).reshape(-1)[keep])
         R["margin"].append(mar[keep])
@@ -270,15 +306,19 @@ def did(Fe, Ce, lab, seg, mar, min_cell=8):
 def report(R, P, tag):
     cq = R["cos_q"]
     print(f"\n[{tag}] {cq.numel()} probes (margin >= 0.1) | identity u=q: cos(q,z) = {cq.mean():.3f}")
-    print(f"  {'state used at read':<22}{'cos(u,z)':>9}{'gain':>8}{'C':>9}{'F':>9}")
-    for c, nm in (("mem", "W (written)"), ("abl", "W_init (no writes)"), ("shuf", "W of other episode")):
+    print(f"  {'state used at read':<26}{'cos(u,z)':>9}{'cos s=0':>9}{'gain':>8}{'C':>9}{'F':>9}")
+    rows = (("mem", "W (written)"), ("abl", "W_init (no writes)"),
+            ("shuf", "W of other episode"), ("teach", "teacher (perfect slots)"))
+    for c, nm in rows:
         cz = R["cos_" + c]
-        print(f"  {nm:<22}{cz.mean():9.3f}{(cz - cq).mean():8.3f}{R['C_' + c].mean():9.3f}{R['F_' + c].mean():9.3f}")
-    for c in ("mem", "abl"):
+        print(f"  {nm:<26}{cz.mean():9.3f}{R['cos0_' + c].mean():9.3f}{(cz - cq).mean():8.3f}"
+              f"{R['C_' + c].mean():9.3f}{R['F_' + c].mean():9.3f}")
+    for c in ("mem", "abl", "teach"):
         g = [(R["cos_" + c] - cq)[R["seg"] == k].mean().item() for k in range(P)]
         print(f"  gain by delay (long->short), {c}: " + " ".join(f"{x:6.3f}" for x in g))
     if R["absent_cos"].numel():
-        print(f"  absent probes: cos(u,q) = {R['absent_cos'].mean():.3f} (want ~1)")
+        a, a0 = R["absent_cos"].mean().item(), R["absent_cos0"].mean().item()
+        print(f"  absent probes: cos(u,q) sample {a:.3f} | sigma=0 {a0:.3f}   gate (>= 0.95): {'PASS' if a >= 0.95 else 'not yet'}")
     dF, dC = did(R["F_mem"], R["C_mem"], R["b"], R["seg"], R["margin"])
     print(f"  audit (crude strata): dF_b = {dF:.4f}  dC_b = {dC:.4f}  S_b = {dF - dC:.4f}   [compare across full / unif / scram runs]")
 
@@ -287,7 +327,7 @@ def report(R, P, tag):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cache", default="gut_minilm.pt")
-    ap.add_argument("--steps", type=int, default=2000)
+    ap.add_argument("--steps", type=int, default=3000)
     ap.add_argument("--B", type=int, default=16)
     ap.add_argument("--T", type=int, default=20)
     ap.add_argument("--L", type=int, default=6)
@@ -296,38 +336,56 @@ def main():
     ap.add_argument("--S_w", type=int, default=3)
     ap.add_argument("--S_r", type=int, default=6)
     ap.add_argument("--kappa", type=float, default=2.0)
-    ap.add_argument("--sigma", type=float, default=0.1)
+    ap.add_argument("--sigma", type=float, default=0.05)
     ap.add_argument("--sigma_cue", type=float, default=0.0)
     ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--lr_w", type=float, default=1e-4, help="learning rate for the writer (phi)")
+    ap.add_argument("--cap_c", type=float, default=1.5, help="structural soft norm cap on state rows")
     ap.add_argument("--lam_cap", type=float, default=1e-3)
     ap.add_argument("--lam_or", type=float, default=0.25)
     ap.add_argument("--lam_str", type=float, default=0.0)
+    ap.add_argument("--p_teach", type=float, default=0.5, help="prob. an episode's probes read the teacher state")
+    ap.add_argument("--lam_scaf", type=float, default=1.0)
+    ap.add_argument("--scaf_steps", type=int, default=1000, help="linear anneal of scaffold weight to 0")
+    ap.add_argument("--n_scaf", type=int, default=3, help="scaffold probes the last n written items")
+    ap.add_argument("--T0", type=int, default=4, help="starting stream length of the curriculum")
+    ap.add_argument("--curr_steps", type=int, default=1000, help="steps to grow T from T0 to T (0 = off)")
     ap.add_argument("--label", choices=["full", "unif", "scram"], default="full")
     ap.add_argument("--no_memory", action="store_true")
     ap.add_argument("--eval_every", type=int, default=500)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
+    assert args.T <= args.K and args.P <= args.T0 <= args.T, "need P <= T0 <= T <= K"
+    if args.no_memory:                                      # keep the cue-only baseline pure
+        args.p_teach, args.lam_scaf = 0.0, 0.0
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(args.seed)
 
     tr = Episodes(args.cache, T=args.T, n_probe=args.P, sigma_cue=args.sigma_cue, seed=args.seed)
-    ev = copy.copy(tr)                                      # shares tensors; disjoint books for eval
+    ev = copy.copy(tr)                                      # shares tensors; disjoint books for eval (always full T)
     ev.rng, ev.g = random.Random(999), torch.Generator().manual_seed(999)
     held = {b for b in tr.books if b % 10 == 0}
     ev.books, ev.big = [b for b in tr.books if b in held], [b for b in tr.big if b in held]
     tr.books, tr.big = [b for b in tr.books if b not in held], [b for b in tr.big if b not in held]
 
-    model = CFMMEM(K=args.K, S_w=args.S_w, S_r=args.S_r, kappa=args.kappa, sigma=args.sigma).to(dev)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
+    model = CFMMEM(K=args.K, S_w=args.S_w, S_r=args.S_r, kappa=args.kappa, sigma=args.sigma, cap_c=args.cap_c).to(dev)
+    wids = {id(p) for p in model.writer.parameters()}
+    opt = torch.optim.AdamW([
+        {"params": [p for p in model.parameters() if id(p) not in wids], "lr": args.lr},
+        {"params": list(model.writer.parameters()), "lr": args.lr_w}], weight_decay=0.0)
     mode = "cue-only (no_memory)" if args.no_memory else f"memory, label={args.label}"
-    print(f"{mode} | device {dev} | train books {len(tr.books)}, eval books {len(ev.books)}")
+    print(f"{mode} | sigma {args.sigma} | device {dev} | train books {len(tr.books)}, eval books {len(ev.books)}")
 
     for step in range(1, args.steps + 1):
+        T_cur = args.T if args.curr_steps <= 0 else min(args.T, args.T0 + int((args.T - args.T0) * step / args.curr_steps))
+        tr.T, tr.n_home = T_cur, int(T_cur * tr.p_home)    # curriculum: short -> long streams
         bt = to_dev(tr.batch(args.B), dev)
-        W, info = run_episode(model, bt, args.L, args.label, grad=True, memory=not args.no_memory)
-        L_read, L_or = probe_terms(model, W, bt, info["w"])
+        W, info = run_episode(model, bt, min(args.L, T_cur), args.label, grad=True, memory=not args.no_memory)
+        L_read, L_or = probe_terms(model, W, bt, info["w"], args.p_teach)
         L_cap = (W.norm(dim=-1) - 1).clamp_min(0).pow(2).sum(-1).mean()
-        loss = L_read + args.lam_or * L_or + args.lam_cap * L_cap
+        lam_s = args.lam_scaf * max(0.0, 1.0 - step / args.scaf_steps)
+        L_sc = scaffold_loss(model, W, bt, args.n_scaf) if lam_s > 0 else torch.zeros((), device=dev)
+        loss = L_read + args.lam_or * L_or + args.lam_cap * L_cap + lam_s * L_sc
         if args.lam_str > 0 and info["last"] is not None:
             loss = loss + args.lam_str * reflow_loss(model, info["last"])
         opt.zero_grad(set_to_none=True)
@@ -336,7 +394,7 @@ def main():
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         if step % 50 == 0 or step == 1:
-            print(f"step {step:5d} | read {L_read.item():7.3f} oracle {L_or.item():7.3f} cap {L_cap.item():.4f} "
+            print(f"step {step:5d} T {T_cur:2d} | read {L_read.item():7.3f} oracle {L_or.item():7.3f} scaf {L_sc.item():7.3f} "
                   f"| disp {float(info['disp']):.4f} |grad phi| {float(g_w):.4f} |W| {W.norm(dim=-1).mean().item():.3f} "
                   f"| s_ema {model.s_ema.item():.2f}")
         if step % args.eval_every == 0 and step != args.steps:
